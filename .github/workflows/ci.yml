@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Docs
+        run: cargo doc --no-deps -p rslu
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the library on the minimum supported Rust version
+        run: cargo check -p rslu --all-targets
+
+  benchmark-gate:
+    # Fails the build if accuracy on the default profile drops more than 0.5
+    # points below bench/baseline.json. Refresh the baseline deliberately with
+    #   cargo run --release -p rslu-bench -- check --update
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Cache benchmark datasets
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: rslu-datasets-v2-${{ hashFiles('bench/src/sets.rs') }}
+      - name: Fetch datasets
+        run: cargo run --release -p rslu-bench -- fetch --only ATIS,SNIPS,CLINC150,BANKING77
+      - name: Check for regressions
+        run: cargo run --release -p rslu-bench -- check
