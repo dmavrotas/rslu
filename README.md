@@ -23,7 +23,7 @@ Python), and the other crates cover one piece (POS tagging, TF-IDF, intent only)
 rslu = { git = "https://github.com/dmavrotas/rslu" }
 ```
 
-Requires Rust 1.85 or newer.
+Requires Rust 1.88 or newer (the code uses let-chains).
 
 ## Example: train on a handful of sentences
 
