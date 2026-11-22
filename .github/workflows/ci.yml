@@ -50,8 +50,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: data
-          key: rslu-datasets-v1-${{ hashFiles('bench/src/main.rs') }}
+          key: rslu-datasets-v2-${{ hashFiles('bench/src/sets.rs') }}
       - name: Fetch datasets
-        run: cargo run --release -p rslu-bench -- fetch
+        run: cargo run --release -p rslu-bench -- fetch --only ATIS,SNIPS,CLINC150,BANKING77
       - name: Check for regressions
         run: cargo run --release -p rslu-bench -- check

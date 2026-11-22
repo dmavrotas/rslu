@@ -328,6 +328,108 @@ fn ngram_features(tokens: &[String], max_n: usize, char_n: usize) -> Vec<String>
     out
 }
 
+/// Predicts an intent label and a confidence in `(0, 1]` for tokens.
+pub trait Classifier {
+    /// The most likely label and its probability.
+    fn predict(&self, tokens: &[String]) -> (&str, f64);
+}
+
+impl Classifier for LogReg {
+    fn predict(&self, tokens: &[String]) -> (&str, f64) {
+        LogReg::predict(self, tokens)
+    }
+}
+
+/// A multinomial Naive Bayes classifier over word unigrams and bigrams with
+/// Laplace smoothing: the baseline every other model must beat.
+#[derive(Debug, Clone)]
+pub struct NaiveBayes {
+    labels: Vec<String>,
+    log_prior: Vec<f64>,
+    counts: Vec<HashMap<String, f64>>, // label -> feature -> count
+    totals: Vec<f64>,                  // label -> total feature count
+    vocab: usize,
+}
+
+/// Unigrams plus bigrams, with sentence boundary markers.
+fn nb_features(tokens: &[String]) -> Vec<String> {
+    let mut f = Vec::with_capacity(2 * tokens.len() + 1);
+    let mut prev = "<s>";
+    for t in tokens {
+        f.push(t.clone());
+        f.push(format!("{prev} {t}"));
+        prev = t;
+    }
+    f.push(format!("{prev} </s>"));
+    f
+}
+
+impl NaiveBayes {
+    /// Fits a classifier on the utterances that have an intent. Returns `None`
+    /// when none do.
+    pub fn train(data: &[Utterance]) -> Option<Self> {
+        let examples: Vec<&Utterance> = data.iter().filter(|u| !u.intent.is_empty()).collect();
+        if examples.is_empty() {
+            return None;
+        }
+        let mut labels: Vec<String> = examples.iter().map(|u| u.intent.clone()).collect();
+        labels.sort_unstable(); // deterministic tie-breaking
+        labels.dedup();
+        let index: HashMap<&str, usize> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (l.as_str(), i))
+            .collect();
+        let mut docs = vec![0.0; labels.len()];
+        let mut counts = vec![HashMap::new(); labels.len()];
+        let mut totals = vec![0.0; labels.len()];
+        let mut vocab = HashSet::new();
+        for u in &examples {
+            let l = index[u.intent.as_str()];
+            docs[l] += 1.0;
+            for f in nb_features(&u.tokens) {
+                *counts[l].entry(f.clone()).or_insert(0.0) += 1.0;
+                totals[l] += 1.0;
+                vocab.insert(f);
+            }
+        }
+        let n = examples.len() as f64;
+        Some(Self {
+            log_prior: docs.iter().map(|d| (d / n).ln()).collect(),
+            vocab: vocab.len(),
+            labels,
+            counts,
+            totals,
+        })
+    }
+
+    /// The labels this classifier can emit, sorted.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+}
+
+impl Classifier for NaiveBayes {
+    fn predict(&self, tokens: &[String]) -> (&str, f64) {
+        let feats = nb_features(tokens);
+        let scores: Vec<f64> = (0..self.labels.len())
+            .map(|l| {
+                let denom = self.totals[l] + self.vocab as f64;
+                feats.iter().fold(self.log_prior[l], |s, f| {
+                    s + ((self.counts[l].get(f).copied().unwrap_or(0.0) + 1.0) / denom).ln()
+                })
+            })
+            .collect();
+        let best = scores
+            .iter()
+            .enumerate()
+            .fold(0, |b, (i, &s)| if s > scores[b] { i } else { b });
+        // softmax over log scores for a calibrated-ish confidence
+        let sum: f64 = scores.iter().map(|s| (s - scores[best]).exp()).sum();
+        (&self.labels[best], 1.0 / sum)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,5 +511,29 @@ mod tests {
         let (label, conf) = m.predict(&toks("zzzz qqqq"));
         assert!(m.labels().iter().any(|l| l == label));
         assert!(conf > 0.0);
+    }
+
+    #[test]
+    fn naive_bayes_learns_and_is_a_classifier() {
+        let nb = NaiveBayes::train(&weather_vs_book()).unwrap();
+        assert_eq!(nb.labels(), ["book", "weather"]);
+        let clf: &dyn Classifier = &nb;
+        assert_eq!(clf.predict(&toks("book a table in vienna")).0, "book");
+        let (label, conf) = clf.predict(&toks("will it rain in vienna"));
+        assert_eq!(label, "weather");
+        assert!(conf > 0.5 && conf <= 1.0);
+    }
+
+    #[test]
+    fn naive_bayes_without_intents_is_none() {
+        assert!(NaiveBayes::train(&[]).is_none());
+        assert!(NaiveBayes::train(&[parse_annotated("hi [x : there]", "")]).is_none());
+    }
+
+    #[test]
+    fn logreg_implements_classifier() {
+        let m = LogReg::train(&weather_vs_book(), &LogRegOptions::default()).unwrap();
+        let clf: &dyn Classifier = &m;
+        assert_eq!(clf.predict(&toks("reserve a table in rome")).0, "book");
     }
 }

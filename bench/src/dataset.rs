@@ -86,6 +86,109 @@ pub fn parse_snips(mut r: impl Read) -> Result<Vec<Utterance>> {
     Ok(out)
 }
 
+/// Reads all of `r`, replacing invalid UTF-8 with U+FFFD like Go's decoder.
+fn read_lossy(mut r: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    r.read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Reads CLINC150's `data_full.json` and returns one split (`train`, `val`,
+/// `test`, or the out-of-scope `oos_*` splits) as intent-only utterances.
+pub fn parse_clinc(r: impl Read, split: &str) -> Result<Vec<Utterance>> {
+    let mut raw: std::collections::HashMap<String, Vec<Vec<String>>> =
+        serde_json::from_str(&read_lossy(r)?).context("invalid clinc json")?;
+    let Some(rows) = raw.remove(split) else {
+        bail!("clinc: unknown split {split:?}");
+    };
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, row)| match <[String; 2]>::try_from(row) {
+            Ok([text, intent]) => Ok(Utterance {
+                tokens: tokenize(&text),
+                intent,
+                slots: Vec::new(),
+            }),
+            Err(row) => bail!("clinc: {split} row {i} has {} fields", row.len()),
+        })
+        .collect()
+}
+
+/// Reads a BANKING77 CSV file (header `text,category`).
+pub fn parse_banking(r: impl Read) -> Result<Vec<Utterance>> {
+    let text = read_lossy(r)?;
+    let mut out = Vec::new();
+    for (i, rec) in csv::Reader::from_reader(text.as_bytes())
+        .records()
+        .enumerate()
+    {
+        let rec = rec?;
+        if rec.len() != 2 {
+            bail!("banking: row {} has {} fields", i + 1, rec.len());
+        }
+        out.push(Utterance {
+            tokens: tokenize(&rec[0]),
+            intent: rec[1].to_owned(),
+            slots: Vec::new(),
+        });
+    }
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+struct MassiveRecord {
+    partition: String,
+    intent: String,
+    annot_utt: String,
+}
+
+/// Reads a MASSIVE JSONL file and keeps one partition (`train`, `dev` or
+/// `test`). Slots come from the inline `[type : value]` markup.
+pub fn parse_massive(r: impl Read, partition: &str) -> Result<Vec<Utterance>> {
+    let mut out = Vec::new();
+    for (n, line) in read_lossy(r)?.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let rec: MassiveRecord =
+            serde_json::from_str(line).with_context(|| format!("massive line {}", n + 1))?;
+        if rec.partition == partition {
+            out.push(rslu::parse_annotated(&rec.annot_utt, &rec.intent));
+        }
+    }
+    Ok(out)
+}
+
+/// Reads the MIT Restaurant/Movie corpora: one `tag<TAB>word` per line, blank
+/// lines between sentences. These are slot-only (no intent).
+pub fn parse_mit_bio(r: impl Read) -> Result<Vec<Utterance>> {
+    fn flush(out: &mut Vec<Utterance>, toks: &mut Vec<String>, tags: &mut Vec<String>) {
+        if !toks.is_empty() {
+            out.push(Utterance {
+                tokens: std::mem::take(toks),
+                intent: String::new(),
+                slots: spans_from_bio(tags),
+            });
+        }
+        tags.clear();
+    }
+    let (mut out, mut toks, mut tags) = (Vec::new(), Vec::new(), Vec::new());
+    for (n, line) in read_lossy(r)?.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            flush(&mut out, &mut toks, &mut tags);
+            continue;
+        }
+        let Some((tag, word)) = line.split_once('\t') else {
+            bail!("mit-bio line {}: expected tag<TAB>word", n + 1);
+        };
+        tags.push(tag.to_owned());
+        toks.push(word.to_owned());
+    }
+    flush(&mut out, &mut toks, &mut tags);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +223,48 @@ mod tests {
         assert_eq!(u[0].tokens, ["weather", "in", "new", "york", "today"]);
         assert_eq!(u[0].slots, [Span::new(2, 4, "city")]);
         assert_eq!(u[0].intent, "GetWeather");
+    }
+
+    #[test]
+    fn clinc_returns_the_requested_split() {
+        let json = r#"{"train":[["what is my balance","balance"]],"test":[["hi there","greet"]]}"#;
+        let u = parse_clinc(json.as_bytes(), "test").unwrap();
+        assert_eq!((u[0].tokens.len(), u[0].intent.as_str()), (2, "greet"));
+        assert!(parse_clinc(json.as_bytes(), "nope").is_err());
+        assert!(parse_clinc(r#"{"train":[["only one"]]}"#.as_bytes(), "train").is_err());
+    }
+
+    #[test]
+    fn banking_handles_quoted_commas() {
+        let csv = "text,category\n\"Hello, I am waiting?\",card_arrival\nplain,other\n";
+        let u = parse_banking(csv.as_bytes()).unwrap();
+        assert_eq!(u.len(), 2);
+        assert_eq!(u[0].tokens, ["hello", "i", "am", "waiting"]);
+        assert_eq!(u[1].intent, "other");
+    }
+
+    #[test]
+    fn massive_filters_partition_and_reads_markup() {
+        let jsonl = concat!(
+            r#"{"partition":"train","intent":"alarm_set","annot_utt":"wake me at [time : nine am]"}"#,
+            "\n",
+            r#"{"partition":"test","intent":"x","annot_utt":"hello"}"#,
+            "\n\n",
+        );
+        let u = parse_massive(jsonl.as_bytes(), "train").unwrap();
+        assert_eq!(u.len(), 1);
+        assert_eq!(u[0].slots, [Span::new(3, 5, "time")]);
+        assert!(parse_massive("not json".as_bytes(), "train").is_err());
+    }
+
+    #[test]
+    fn mit_bio_splits_sentences_on_blank_lines() {
+        let bio = "B-Rating\t2\nI-Rating\tstar\nO\trestaurants\n\nO\thi\n";
+        let u = parse_mit_bio(bio.as_bytes()).unwrap();
+        assert_eq!(u.len(), 2);
+        assert_eq!(u[0].tokens, ["2", "star", "restaurants"]);
+        assert_eq!(u[0].slots, [Span::new(0, 2, "Rating")]);
+        assert_eq!(u[0].intent, "");
+        assert!(parse_mit_bio("no-tab-here\n".as_bytes()).is_err());
     }
 }

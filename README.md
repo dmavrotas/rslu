@@ -86,31 +86,82 @@ name decide.
 
 ## Benchmarks
 
-`cargo run --release -p rslu-bench -- fetch` downloads the public corpora, and
-`cargo run --release -p rslu-bench -- run` scores three profiles on the standard test splits.
-Only ATIS and SNIPS are ported so far; CLINC150, BANKING77, MASSIVE and MIT-Restaurant are next.
+`cargo run --release -p rslu-bench -- fetch` downloads the six public corpora (ATIS, SNIPS,
+MASSIVE, CLINC150, BANKING77, MIT-Restaurant), and `cargo run --release -p rslu-bench -- run`
+scores three profiles on the standard test splits (`--only a,b` selects, `--typo 0.3` corrupts
+the test set to measure robustness).
 
-Side by side with gonlu, same machine, same data:
+Side by side with [gonlu](https://github.com/dmavrotas/gonlu), same machine, same data. Each
+cell is intent accuracy / slot F1 / frame accuracy (`-` = not applicable):
 
-| dataset | profile | metric | gonlu | rslu |
-|---|---|---|---|---|
-| ATIS | default | intent / slot F1 / frame | 93.73 / 93.27 / 79.62 | 92.95 / 93.52 / 79.40 |
-| ATIS | robust | intent / slot F1 / frame | 92.95 / 93.35 / 79.51 | 93.28 / 93.16 / 79.17 |
-| ATIS | robust+gaz | intent / slot F1 / frame | 92.95 / 93.75 / 79.62 | 93.28 / 93.77 / 80.52 |
-| SNIPS | default | intent / slot F1 / frame | 98.57 / 91.49 / 80.29 | 98.29 / 91.09 / 80.00 |
-| SNIPS | robust | intent / slot F1 / frame | 98.43 / 91.17 / 79.29 | 98.43 / 90.85 / 78.71 |
-| SNIPS | robust+gaz | intent / slot F1 / frame | 98.43 / 92.32 / 80.71 | 98.43 / 92.72 / 81.43 |
+| dataset | profile | gonlu | rslu |
+|---|---|---|---|
+| ATIS | default | 93.73 / 93.27 / 79.62 | 92.95 / 93.52 / 79.40 |
+| ATIS | robust | 92.95 / 93.35 / 79.51 | 93.28 / 93.16 / 79.17 |
+| ATIS | robust+gaz | 92.95 / 93.75 / 79.62 | 93.28 / 93.77 / 80.52 |
+| SNIPS | default | 98.57 / 91.49 / 80.29 | 98.29 / 91.09 / 80.00 |
+| SNIPS | robust | 98.43 / 91.17 / 79.29 | 98.43 / 90.85 / 78.71 |
+| SNIPS | robust+gaz | 98.43 / 92.32 / 80.71 | 98.43 / 92.72 / 81.43 |
+| MASSIVE | default | 85.44 / 76.40 / 63.95 | 85.24 / 75.71 / 63.21 |
+| MASSIVE | robust | 85.31 / 75.99 / 63.55 | 85.44 / 75.82 / 63.45 |
+| MASSIVE | robust+gaz | 85.31 / 76.29 / 63.58 | 85.44 / 75.60 / 63.48 |
+| CLINC150 | default | 91.67 / - / - | 91.42 / - / - |
+| CLINC150 | robust | 91.42 / - / - | 91.51 / - / - |
+| BANKING77 | default | 91.04 / - / - | 91.04 / - / - |
+| BANKING77 | robust | 90.75 / - / - | 90.62 / - / - |
+| MIT-Rest | default | - / 76.28 / - | - / 75.86 / - |
+| MIT-Rest | robust | - / 76.13 / - | - / 75.91 / - |
+| MIT-Rest | robust+gaz | - / 77.23 / - | - / 76.95 / - |
 
-Every cell is within 0.8 points of gonlu except one (ATIS robust+gaz frame, +0.9), and the
-differences go both ways. The two libraries are not bit-identical: both shuffle training data
-with a fixed seed, but the generators differ, and a perceptron is order-sensitive. The
-accuracy numbers are therefore equivalent, not equal.
+Every cell is within 0.9 points of gonlu, and the differences go both ways. The two libraries
+are not bit-identical: both shuffle training data with a fixed seed, but the generators
+differ, and a perceptron is order-sensitive. The accuracy is equivalent, not equal.
+Like gonlu, the linear models are strong on small domain vocabularies, in the low 90s on
+CLINC150 and BANKING77, and clearly behind fine-tuned transformers on those.
 
-Speed is not equivalent: rslu is much faster. Scoring all three profiles on ATIS and SNIPS
-takes about 30 s in rslu (`--release`) against about 4 min in gonlu on the same machine.
+Speed is not equivalent: rslu is faster. ATIS and SNIPS (all profiles) take about 30 s in
+rslu (`--release`) against 4 min 1 s in gonlu; the other four corpora take about 75 s against
+4 min 32 s. Over all six that is roughly 5x.
 
-CI runs `rslu-bench check`, which scores the default profile and fails if any metric drops
-more than 0.5 points below [`bench/baseline.json`](bench/baseline.json).
+CI runs `rslu-bench check`, which scores the default profile on ATIS, SNIPS, CLINC150 and
+BANKING77 and fails if any metric drops more than 0.5 points below
+[`bench/baseline.json`](bench/baseline.json) (or if a baselined benchmark produces no result).
+The baseline file has the same format as gonlu's.
+
+## Example: a real benchmark corpus
+
+Train on the 13,784-utterance [SNIPS](https://github.com/snipsco/nlu-benchmark) training set
+([`bench/examples/snips.rs`](bench/examples/snips.rs); fetch it first). Real output,
+including the mistakes:
+
+```
+"Play some Beatles on Spotify"
+  intent: PlayMusic (99%)
+  slot:   genre                    "beatles"            <- should be artist
+  slot:   service                  "spotify"
+"What's the weather like in Paris tomorrow"
+  intent: GetWeather (99%)
+  slot:   city                     "paris"
+  slot:   timeRange                "tomorrow"
+"Book a table for 4 at a pizza place in Boston"
+  intent: BookRestaurant (100%)
+  slot:   party_size_number        "4"
+  slot:   served_dish              "pizza"
+  slot:   city                     "boston"
+"Add Bohemian Rhapsody to my road trip playlist"
+  intent: AddToPlaylist (97%)
+  slot:   artist                   "bohemian rhapsody"
+  slot:   playlist_owner           "my"
+  slot:   playlist                 "road trip"
+"Rate this book 5 out of 6 stars"
+  intent: RateBook (100%)
+  slot:   rating_value             "5"
+  slot:   best_rating              "6"
+  slot:   rating_unit              "stars"
+```
+
+(The `<- should be artist` annotation is added by hand; the `Rate this book` output also lists
+`object_select` and `object_type` slots, omitted here.)
 
 ## Design notes
 
@@ -118,6 +169,8 @@ more than 0.5 points below [`bench/baseline.json`](bench/baseline.json).
 - Inputs are tokenised by lower-casing and splitting on anything but letters, digits and
   apostrophes. Affixes and character n-grams are character-based, so non-ASCII text is safe.
 - A trained `Model` is immutable and `Send + Sync`.
+- `NaiveBayes` (unigram+bigram, Laplace smoothing) ships as the baseline every other classifier
+  must beat; both classifiers implement the `Classifier` trait.
 - `unsafe` is forbidden; clippy pedantic is enabled and clean.
 
 ## License

@@ -33,7 +33,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 
-pub use intent::{LogReg, LogRegOptions};
+pub use intent::{Classifier, LogReg, LogRegOptions, NaiveBayes};
 pub use link::Link;
 pub use nlu::{
     Span, Utterance, add_typos, bio_from_spans, parse_annotated, spans_from_bio, tokenize,
