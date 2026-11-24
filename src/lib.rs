@@ -22,6 +22,7 @@
 //! # Ok::<(), rslu::Error>(())
 //! ```
 
+mod codec;
 mod gazetteer;
 pub mod intent;
 mod link;
@@ -33,6 +34,7 @@ use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
 
+pub use codec::DecodeError;
 pub use intent::{Classifier, LogReg, LogRegOptions, NaiveBayes};
 pub use link::Link;
 pub use nlu::{

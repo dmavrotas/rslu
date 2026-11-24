@@ -2,7 +2,8 @@
 
 A small, deterministic, **offline, pure-Rust** natural-language-understanding toolkit.
 It classifies the **intent** of a sentence and extracts its **slots** (entities), with no
-network calls, no model files, no unsafe code and **no dependencies**.
+network calls, no unsafe code and **no dependencies**. Trained classifiers can be saved and
+loaded.
 
 It is the Rust counterpart of [gonlu](https://github.com/dmavrotas/gonlu) and uses the same
 algorithms: a logistic-regression intent classifier (TF-IDF word n-grams plus character
@@ -83,6 +84,42 @@ Linking prefers the whole entry, then its last word (a surname beats a forename)
 words, each exact before typo-tolerant. Ties go to the entry listed first. `Model::link`
 exposes the lookup with a match cost so a caller can compare several slot types and let the
 name decide.
+
+## Saving a trained classifier
+
+Training is fast, but not free: a few hundred sentences take ~15 ms, which is too slow for a
+hot path such as a CLI hook. Train once, save the bytes, and load them where you predict:
+
+```rust
+use rslu::{LogReg, LogRegOptions, tokenize};
+
+// `data` as in the example above
+let model = LogReg::train(&data, &LogRegOptions::default()).unwrap();
+std::fs::write("intent.rslu", model.to_bytes())?;
+
+// later, or in another program (for example with include_bytes!):
+let model = LogReg::from_bytes(&std::fs::read("intent.rslu")?)?;
+let (label, confidence) = model.predict(&tokenize("book a table for two"));
+```
+
+A loaded model predicts exactly what the saved one did: same labels, bit-identical
+probabilities. A model of ~400 sentences is ~570 KB and loads in ~0.5 ms. Decoding never
+panics: truncated, foreign or corrupt input is a `DecodeError`.
+
+**Format** (version 1, shared with gonlu): little-endian; strings and lists carry a `u32`
+length; floats are `f64` bit patterns.
+
+| field | encoding |
+|---|---|
+| magic, version, kind | `"RSLU"`, `u32` 1, string `"logreg"` |
+| options | `u64` epochs, `f64` learning rate, `f64` l2, `u64` max n, `u64` char n, `f64` typo augment, `u8` tfidf, `f64` class balance, `f64` norm power |
+| labels | `u32` count, then strings, sorted and distinct |
+| features | `u32` count, then each feature string in column order |
+| idf | `u8` flag, then one `f64` per feature when set (iff tfidf) |
+| bias | one `f64` per label |
+| weights | one row per label, one `f64` per feature |
+
+Nothing may follow the weights. The slot tagger cannot be saved yet.
 
 ## Benchmarks
 

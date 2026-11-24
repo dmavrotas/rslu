@@ -2,6 +2,9 @@
 //! character n-grams, trained with Adagrad. Training is deterministic.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Read, Write};
+
+use crate::codec::{DecodeError, Reader, Writer};
 
 use crate::nlu::{Utterance, add_typos};
 use crate::rng::SplitMix64;
@@ -252,7 +255,160 @@ impl LogReg {
     pub fn labels(&self) -> &[String] {
         &self.labels
     }
+
+    /// Encodes the trained model in rslu's binary model format, so it can be
+    /// shipped (for example with `include_bytes!`) and loaded without
+    /// retraining. [`LogReg::from_bytes`] restores a model that predicts
+    /// exactly the same labels and probabilities.
+    ///
+    /// ```
+    /// use rslu::{LogReg, LogRegOptions, parse_annotated, tokenize};
+    ///
+    /// let data = [
+    ///     parse_annotated("book a table", "book"),
+    ///     parse_annotated("what is the weather", "weather"),
+    /// ];
+    /// let model = LogReg::train(&data, &LogRegOptions::default()).unwrap();
+    /// let loaded = LogReg::from_bytes(&model.to_bytes())?;
+    /// let tokens = tokenize("book a table for two");
+    /// assert_eq!(loaded.predict(&tokens), model.predict(&tokens));
+    /// # Ok::<(), rslu::DecodeError>(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If the model has more than `u32::MAX` labels or features, which the
+    /// format cannot describe.
+    #[must_use]
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut w = Writer::new(KIND);
+        let o = &self.opts;
+        w.usize(o.epochs);
+        w.f64(o.learning_rate);
+        w.f64(o.l2);
+        w.usize(o.max_n);
+        w.usize(o.char_n);
+        w.f64(o.typo_augment);
+        w.u8(u8::from(o.tfidf));
+        w.f64(o.class_balance);
+        w.f64(o.norm_power);
+
+        w.len(self.labels.len());
+        for l in &self.labels {
+            w.str(l);
+        }
+        let mut names = vec![""; self.feat.len()];
+        for (name, &id) in &self.feat {
+            names[id] = name;
+        }
+        w.len(names.len());
+        for name in names {
+            w.str(name);
+        }
+        w.u8(u8::from(self.idf.is_some()));
+        if let Some(idf) = &self.idf {
+            w.f64s(idf);
+        }
+        w.f64s(&self.bias);
+        for row in &self.w {
+            w.f64s(row);
+        }
+        w.finish()
+    }
+
+    /// Decodes a model written by [`LogReg::to_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// A [`DecodeError`] when the input is not an rslu model, holds another
+    /// kind of model, comes from an unsupported format version, or is
+    /// truncated or corrupt. Decoding never panics.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader::new(bytes, KIND)?;
+        let opts = LogRegOptions {
+            epochs: r.usize()?,
+            learning_rate: r.f64()?,
+            l2: r.f64()?,
+            max_n: r.usize()?,
+            char_n: r.usize()?,
+            typo_augment: r.f64()?,
+            tfidf: r.bool()?,
+            class_balance: r.f64()?,
+            norm_power: r.f64()?,
+        };
+
+        // Prediction cost grows with the n-gram lengths: bound them so a
+        // corrupt file cannot make `predict` loop for ages.
+        if !(1..=MAX_NGRAM).contains(&opts.max_n) || opts.char_n > MAX_NGRAM {
+            return Err(DecodeError::Corrupt("n-gram length out of range"));
+        }
+        let n_labels = r.len(4)?;
+        let labels = (0..n_labels)
+            .map(|_| r.str())
+            .collect::<Result<Vec<_>, _>>()?;
+        if labels.is_empty() || !labels.is_sorted_by(|a, b| a < b) {
+            return Err(DecodeError::Corrupt(
+                "labels must be non-empty, sorted and distinct",
+            ));
+        }
+        let n_feat = r.len(4)?;
+        let mut feat = HashMap::with_capacity(n_feat);
+        for id in 0..n_feat {
+            if feat.insert(r.str()?, id).is_some() {
+                return Err(DecodeError::Corrupt("duplicate feature"));
+            }
+        }
+        let idf = if r.bool()? {
+            Some(r.f64s(n_feat)?)
+        } else {
+            None
+        };
+        if idf.is_some() != opts.tfidf {
+            return Err(DecodeError::Corrupt(
+                "idf weights do not match the tfidf option",
+            ));
+        }
+        let bias = r.f64s(n_labels)?;
+        let w = (0..n_labels)
+            .map(|_| r.f64s(n_feat))
+            .collect::<Result<Vec<_>, _>>()?;
+        r.finish()?;
+        Ok(Self {
+            labels,
+            opts,
+            feat,
+            idf,
+            w,
+            bias,
+        })
+    }
+
+    /// Writes [`LogReg::to_bytes`] to `out`.
+    ///
+    /// # Errors
+    ///
+    /// Any error from writing to `out`.
+    pub fn write_to(&self, mut out: impl Write) -> io::Result<()> {
+        out.write_all(&self.to_bytes())
+    }
+
+    /// Reads all of `input` and decodes it with [`LogReg::from_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Io`] when reading fails, otherwise as
+    /// [`LogReg::from_bytes`].
+    pub fn read_from(mut input: impl Read) -> Result<Self, DecodeError> {
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes)?;
+        Self::from_bytes(&bytes)
+    }
 }
+
+/// The kind tag of logistic-regression models in the binary format.
+const KIND: &str = "logreg";
+/// Longest word or character n-gram a decoded model may use.
+const MAX_NGRAM: usize = 16;
 
 /// Binary or TF-IDF values for `ids`, with optional length normalisation.
 fn make_row(ids: Vec<usize>, idf: Option<&[f64]>, norm_power: f64) -> Row {
