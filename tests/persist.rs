@@ -1,5 +1,6 @@
 //! Saving and loading trained classifiers.
 
+use std::fmt::Write as _;
 use std::io::{self, Cursor, Read};
 
 use rslu::{DecodeError, LogReg, LogRegOptions, Utterance, parse_annotated, tokenize};
@@ -127,4 +128,70 @@ fn flipped_bytes_never_panic() {
             let _ = model.predict(&tokenize("book a table"));
         }
     }
+}
+
+// Cross-library fixtures, shared with gonlu (intent/persist_test.go): a model
+// saved by one library (NAME-logreg.bin) and the predictions that library made
+// with it (NAME-logreg.txt), one probe per line: label, probability as hex
+// f64 bits, space-separated tokens. Both libraries train on `corpus()`.
+
+const FIXTURE_PROBES: [&[&str]; 6] = [
+    &["book", "a", "table", "in", "vienna"],
+    &["weather", "in", "tokyo", "tomorrow"],
+    &["play", "jazz"],
+    &[],
+    &["completely", "unrelated", "words"],
+    &["bokk", "a", "tabel"],
+];
+
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
+}
+
+/// Loads a model trained and saved by gonlu. Probabilities may differ in the
+/// last bits (the two libraries sum in a different order), never the label.
+#[test]
+fn loads_models_saved_by_gonlu() {
+    let model = LogReg::from_bytes(&std::fs::read(fixture("gonlu-logreg.bin")).unwrap()).unwrap();
+    let text = std::fs::read_to_string(fixture("gonlu-logreg.txt")).unwrap();
+    let mut probes = 0;
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let (label, bits, tokens) = (
+            parts.next().unwrap(),
+            parts.next().unwrap(),
+            parts.next().unwrap_or(""),
+        );
+        let want = f64::from_bits(u64::from_str_radix(bits, 16).unwrap());
+        let tokens: Vec<String> = tokens.split_whitespace().map(str::to_owned).collect();
+        let (got_label, got) = model.predict(&tokens);
+        assert_eq!(got_label, label, "{tokens:?}");
+        assert!(
+            (got - want).abs() <= 1e-12,
+            "{tokens:?}: {got} vs gonlu {want}"
+        );
+        probes += 1;
+    }
+    assert_eq!(probes, FIXTURE_PROBES.len());
+}
+
+/// Regenerates the fixture gonlu's tests load, when `RSLU_WRITE_FIXTURE`
+/// names the output directory.
+#[test]
+fn write_fixture_for_gonlu() {
+    let Ok(dir) = std::env::var("RSLU_WRITE_FIXTURE") else {
+        return;
+    };
+    let dir = std::path::Path::new(&dir);
+    let model = LogReg::train(&corpus(), &LogRegOptions::default()).unwrap();
+    std::fs::write(dir.join("rslu-logreg.bin"), model.to_bytes()).unwrap();
+    let mut lines = String::new();
+    for probe in FIXTURE_PROBES {
+        let tokens: Vec<String> = probe.iter().map(|t| (*t).to_owned()).collect();
+        let (label, p) = model.predict(&tokens);
+        writeln!(lines, "{label}\t{:016x}\t{}", p.to_bits(), probe.join(" ")).unwrap();
+    }
+    std::fs::write(dir.join("rslu-logreg.txt"), lines).unwrap();
 }

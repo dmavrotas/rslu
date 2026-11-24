@@ -119,7 +119,9 @@ length; floats are `f64` bit patterns.
 | bias | one `f64` per label |
 | weights | one row per label, one `f64` per feature |
 
-Nothing may follow the weights. The slot tagger cannot be saved yet.
+Nothing may follow the weights. A model saved by gonlu loads in rslu and vice versa: tests
+load a model saved by gonlu (`tests/fixtures`); labels match and probabilities agree to
+1e-12 (the two libraries sum in a different order). The slot tagger cannot be saved yet.
 
 ## Benchmarks
 
